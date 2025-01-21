@@ -292,7 +292,7 @@ def process_single_referral(index, total_referrals, proxy_dict, target_address, 
         mail_client.create_inbox()
         valid_code = None
         
-        for _ in range(10):
+        for _ in range(60):
             inbox = mail_client.get_inbox()
             if inbox.get('messages'):
                 message = inbox['messages'][0]
