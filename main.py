@@ -173,7 +173,7 @@ def verify_otp(email, valid_code, password, proxy_dict, invite_code, headers, cu
         log(f"Success Register with referral code {invite_code}", Fore.GREEN, current, total)
 
         with open("accounts.txt", "a") as file:
-            file.write(f"{result['result']['session_code']}|{email}|{password}|{result['result']['address']}|{result['result']['master_key']}\n")
+            file.write(f"ID: {result['result']['session_code']}\nEmail: {email}\nPassword: {password}\nAddress: {result['result']['address']}\nPrivate Key: {result['result']['master_key']}\n")
 
         return result['result']['address']
 
