@@ -190,14 +190,28 @@ def send_otp(email, proxy_dict, headers, current=None, total=None):
         'device': "app",
         'is_mobile': "Y"
     }
-    try:
-        response = requests.post(url, data=payload, headers=headers, proxies=proxy_dict, timeout=120)
-        response.raise_for_status()
-        log(f"OTP code sent to {email}", Fore.YELLOW, current, total)
-        return True
-    except requests.RequestException as e:
-        log(f"Failed to send OTP: {e}", Fore.RED, current, total)
-        return False
+    
+    with requests.Session() as session:
+        try:
+            response = session.post(
+                url, 
+                data=payload, 
+                headers=headers, 
+                proxies=proxy_dict,
+                timeout=(10, 30)  # (connect timeout, read timeout)
+            )
+            response.raise_for_status()
+            log(f"OTP code sent to {email}", Fore.YELLOW, current, total)
+            return True
+        except requests.Timeout:
+            log(f"Timeout sending OTP to {email}", Fore.RED, current, total)
+            return False
+        except requests.RequestException as e:
+            log(f"Failed to send OTP: {e}", Fore.RED, current, total)
+            return False
+        finally:
+            if 'response' in locals():
+                response.close()
 
 def verify_otp(email, valid_code, password, proxy_dict, invite_code, headers, current=None, total=None):
     url = "https://arichain.io/api/account/signup_mobile"
