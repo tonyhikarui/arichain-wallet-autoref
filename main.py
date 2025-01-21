@@ -2,6 +2,7 @@ import requests
 import random
 import time
 import string
+import gc
 from colorama import Fore, Style, init
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -36,7 +37,21 @@ class TempMailClient:
         self.email_address = None
         self.key = None
         self.payload = None
-
+        # Add session for connection pooling
+        self.session = requests.Session()
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self, 'session'):
+            self.session.close()
+        
+    def __del__(self):
+        # Cleanup resources
+        if hasattr(self, 'session'):
+            self.session.close()
+            
     def create_email(self) -> dict:
         url = f"{self.base_url}/create"
         params = {
@@ -46,13 +61,16 @@ class TempMailClient:
             'server': '1'
         }
         
-        response = requests.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
-        data = response.json()
-        
-        self.email_address = data['address']
-        self.key = data['key']
-        
-        return data
+        try:
+            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            data = response.json()
+            self.email_address = data['address']
+            self.key = data['key']
+            return data
+        finally:
+            # Ensure response body is read and closed
+            if 'response' in locals():
+                response.close()
 
     def create_inbox(self) -> dict:
         url = f"{self.base_url}/inbox"
@@ -62,20 +80,26 @@ class TempMailClient:
             "key": self.key
         }]
         
-        response = requests.post(url, json=payload, headers=self.headers, proxies=self.proxy_dict)
-        data = response.json()
-        
-        if data:
-            self.payload = data[0]['payload']
-        
-        return data[0]
+        try:
+            response = self.session.post(url, json=payload, headers=self.headers, proxies=self.proxy_dict)
+            data = response.json()
+            if data:
+                self.payload = data[0]['payload']
+            return data[0]
+        finally:
+            if 'response' in locals():
+                response.close()
 
     def get_inbox(self) -> dict:
         url = f"{self.inbox_url}/inbox"
         params = {'payload': self.payload}
         
-        response = requests.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
-        return response.json()
+        try:
+            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            return response.json()
+        finally:
+            if 'response' in locals():
+                response.close()
 
     def get_message_token(self, mid: str) -> str:
         url = f"{self.base_url}/message"
@@ -84,15 +108,23 @@ class TempMailClient:
             'mid': mid
         }
         
-        response = requests.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
-        return response.text
+        try:
+            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            return response.text
+        finally:
+            if 'response' in locals():
+                response.close()
 
     def get_message_content(self, token: str) -> dict:
         url = f"{self.inbox_url}/message"
         params = {'payload': token}
         
-        response = requests.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
-        return response.json()
+        try:
+            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            return response.json()
+        finally:
+            if 'response' in locals():
+                response.close()
 
     def extract_otp(self, html_content: str) -> str:
         try:
@@ -116,10 +148,15 @@ def log(message, color=Fore.WHITE, current=None, total=None):
 def ask(message):
     return input(f"{Fore.YELLOW}{message}{Style.RESET_ALL}")
 
+def format_proxy(proxy):
+    if not proxy.startswith('http://') and not proxy.startswith('https://'):
+        return f"http://{proxy}"
+    return proxy
+
 def load_proxies():
     try:
         with open("proxies.txt", "r") as file:
-            proxies = [line.strip() for line in file if line.strip()]
+            proxies = [format_proxy(line.strip()) for line in file if line.strip()]
         print(f"{Fore.GREEN}\nLoaded {len(proxies)} proxies{Style.RESET_ALL}")
         return proxies
     except FileNotFoundError:
@@ -258,14 +295,14 @@ def get_referral_count():
 
 def get_target_address():
     while True:
-        address = ask('Enter target address for auto-send: ').strip()
+        address = "ARW7GNYDyrBRRDavrue4Ld4GMw5zuMv8H1brm57sxTm4ByFtAENwb" #ask('Enter target address for auto-send: ').strip()
         if address:
             return address
         log('Please enter a valid address.', Fore.YELLOW)
 
 def get_referral_code():
     while True:
-        code = ask('Enter your referral code: ').strip()
+        code = "678d1bfc5f6df" #ask('Enter your referral code: ').strip()
         if code:
             return code
         log('Please enter a valid referral code.', Fore.YELLOW)
@@ -274,55 +311,65 @@ def process_single_referral(index, total_referrals, proxy_dict, target_address, 
     try:
         print(f"{Fore.CYAN}\nStarting new referral process\n{Style.RESET_ALL}")
 
-        mail_client = TempMailClient(proxy_dict)
-        
-        email_data = mail_client.create_email()
-        if not email_data:
-            log("Failed to create email", Fore.RED, index, total_referrals)
-            return False
-            
-        email = email_data['address']
-        password = generate_password()
-        log(f"Generated account: {email}:{password}", Fore.CYAN, index, total_referrals)
+        with TempMailClient(proxy_dict) as mail_client:  # Use context manager
+            email_data = mail_client.create_email()
+            if not email_data:
+                log("Failed to create email", Fore.RED, index, total_referrals)
+                return False
+                
+            email = email_data['address']
+            password = generate_password()
+            log(f"Generated account: {email}:{password}", Fore.CYAN, index, total_referrals)
 
-        if not send_otp(email, proxy_dict, headers, index, total_referrals):
-            log("Failed to send OTP.", Fore.RED, index, total_referrals)
-            return False
+            if not send_otp(email, proxy_dict, headers, index, total_referrals):
+                log("Failed to send OTP.", Fore.RED, index, total_referrals)
+                return False
 
-        mail_client.create_inbox()
-        valid_code = None
-        
-        for _ in range(60):
-            inbox = mail_client.get_inbox()
-            if inbox.get('messages'):
-                message = inbox['messages'][0]
-                token = mail_client.get_message_token(message['mid'])
-                content = mail_client.get_message_content(token)
-                valid_code = mail_client.extract_otp(content['body'])
-                if valid_code:
-                    log(f"Found OTP: {valid_code}", Fore.GREEN, index, total_referrals)
-                    break
-            time.sleep(1)
             mail_client.create_inbox()
+            valid_code = None
+            
+            for _ in range(60):
+                inbox = mail_client.get_inbox()
+                if inbox.get('messages'):
+                    message = inbox['messages'][0]
+                    token = mail_client.get_message_token(message['mid'])
+                    content = mail_client.get_message_content(token)
+                    valid_code = mail_client.extract_otp(content['body'])
+                    if valid_code:
+                        log(f"Found OTP: {valid_code}", Fore.GREEN, index, total_referrals)
+                        break
+                time.sleep(1)
+                mail_client.create_inbox()
 
-        if not valid_code:
-            log("Failed to get OTP code.", Fore.RED, index, total_referrals)
-            return False
+            if not valid_code:
+                log("Failed to get OTP code.", Fore.RED, index, total_referrals)
+                return False
 
-        address = verify_otp(email, valid_code, password, proxy_dict, ref_code, headers, index, total_referrals)
-        if not address:
-            log("Failed to verify OTP.", Fore.RED, index, total_referrals)
-            return False
+            address = verify_otp(email, valid_code, password, proxy_dict, ref_code, headers, index, total_referrals)
+            if not address:
+                log("Failed to verify OTP.", Fore.RED, index, total_referrals)
+                return False
 
-        daily_claim(address, proxy_dict, headers, index, total_referrals)
-        auto_send(email, target_address, password, proxy_dict, headers, index, total_referrals)
-        
-        log(f"Referral #{index} completed!", Fore.MAGENTA, index, total_referrals)
-        return True
-        
+            daily_claim(address, proxy_dict, headers, index, total_referrals)
+            auto_send(email, target_address, password, proxy_dict, headers, index, total_referrals)
+            
+            log(f"Referral #{index} completed!", Fore.MAGENTA, index, total_referrals)
+            return True
+            
     except Exception as e:
         log(f"Error occurred: {str(e)}.", Fore.RED, index, total_referrals)
         return False
+    finally:
+        # Ensure garbage collection
+        gc.collect()
+
+def get_proxy_by_task(proxies, task_index):
+    """Get proxy by task index (1-based indexing)"""
+    if not proxies:
+        return None
+    proxy_index = ((task_index - 1) % len(proxies))  # Convert 1-based to 0-based index
+    proxy = proxies[proxy_index]
+    return {"http": proxy, "https": proxy}
 
 def main():
     print_banner()
@@ -348,8 +395,9 @@ def main():
     
     successful_referrals = 0
     for index in range(1, total_referrals + 1):
-        proxy = get_random_proxy(proxies)
-        proxy_dict = {"http": proxy, "https": proxy} if proxy else None
+        proxy_dict = get_proxy_by_task(proxies, index)
+        if proxy_dict:
+            log(f"Task #{index} using proxy: {list(proxy_dict.values())[0]}", Fore.CYAN, index, total_referrals)
         
         if process_single_referral(index, total_referrals, proxy_dict, target_address, ref_code, headers):
             successful_referrals += 1
