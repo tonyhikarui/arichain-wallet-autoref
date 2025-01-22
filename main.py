@@ -32,6 +32,22 @@ ANDROID_USER_AGENTS = [
     'Mozilla/5.0 (Linux; Android 13; Zenfone 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'
 ]
 
+def retry_with_backoff(func, retries=3, backoff=1):
+    """Retry decorator with exponential backoff"""
+    def wrapper(*args, **kwargs):
+        retry_count = 0
+        while retry_count < retries:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                retry_count += 1
+                if retry_count == retries:
+                    raise
+                sleep_time = (backoff * 2 ** retry_count) + random.uniform(0, 1)
+                log(f"Attempt {retry_count} failed, retrying in {sleep_time:.1f}s: {str(e)}", Fore.YELLOW)
+                time.sleep(sleep_time)
+    return wrapper
+
 class TempMailClient:
     def __init__(self, proxy_dict=None):
         self.base_url = "https://smailpro.com/app"
@@ -105,12 +121,18 @@ class TempMailClient:
         params = {'payload': self.payload}
         
         try:
-            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict, timeout=(10, 30))
+            if not response.text:
+                return {"messages": []}
             return response.json()
+        except (requests.RequestException, ValueError) as e:
+            log(f"Inbox error: {e}", Fore.RED)
+            return {"messages": []}
         finally:
             if 'response' in locals():
                 response.close()
 
+    @retry_with_backoff
     def get_message_token(self, mid: str) -> str:
         url = f"{self.base_url}/message"
         params = {
@@ -119,18 +141,35 @@ class TempMailClient:
         }
         
         try:
-            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            response = self.session.get(
+                url, 
+                params=params, 
+                headers=self.headers, 
+                proxies=self.proxy_dict,
+                timeout=(10, 30)
+            )
+            response.raise_for_status()
             return response.text
         finally:
             if 'response' in locals():
                 response.close()
 
+    @retry_with_backoff
     def get_message_content(self, token: str) -> dict:
         url = f"{self.inbox_url}/message"
         params = {'payload': token}
         
         try:
-            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict)
+            response = self.session.get(
+                url, 
+                params=params, 
+                headers=self.headers, 
+                proxies=self.proxy_dict,
+                timeout=(10, 30)
+            )
+            response.raise_for_status()
+            if not response.text:
+                return {"body": ""}
             return response.json()
         finally:
             if 'response' in locals():
