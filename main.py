@@ -6,6 +6,8 @@ import gc
 from colorama import Fore, Style, init
 from datetime import datetime
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 init()
 
@@ -32,7 +34,7 @@ ANDROID_USER_AGENTS = [
     'Mozilla/5.0 (Linux; Android 13; Zenfone 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'
 ]
 
-def retry_with_backoff(func, retries=3, backoff=1):
+def retry_with_backoff(func, retries=5, backoff=2):
     """Retry decorator with exponential backoff"""
     def wrapper(*args, **kwargs):
         retry_count = 0
@@ -65,6 +67,7 @@ class TempMailClient:
         self.payload = None
         # Add session for connection pooling
         self.session = requests.Session()
+        self.timeout = (30, 60)  # Increase timeout (connect, read)
         
     def __enter__(self):
         return self
@@ -116,21 +119,56 @@ class TempMailClient:
             if 'response' in locals():
                 response.close()
 
+    @retry_with_backoff
     def get_inbox(self) -> dict:
         url = f"{self.inbox_url}/inbox"
         params = {'payload': self.payload}
         
         try:
-            response = self.session.get(url, params=params, headers=self.headers, proxies=self.proxy_dict, timeout=(10, 30))
+            response = self.session.get(
+                url, 
+                params=params, 
+                headers=self.headers, 
+                proxies=self.proxy_dict, 
+                timeout=self.timeout
+            )
+            response.raise_for_status()
             if not response.text:
                 return {"messages": []}
-            return response.json()
-        except (requests.RequestException, ValueError) as e:
+            try:
+                return response.json()
+            except ValueError:
+                log(f"Invalid JSON response: {response.text[:100]}", Fore.RED)
+                return {"messages": []}
+        except requests.RequestException as e:
             log(f"Inbox error: {e}", Fore.RED)
             return {"messages": []}
         finally:
             if 'response' in locals():
                 response.close()
+
+    def process_inbox(self, max_retries=3, wait_time=5):
+        """Process inbox with retries and waiting"""
+        for attempt in range(max_retries):
+            try:
+                inbox = self.get_inbox()
+                if inbox.get('messages'):
+                    message = inbox['messages'][0]
+                    token = self.get_message_token(message['mid'])
+                    if not token:
+                        continue
+                    content = self.get_message_content(token)
+                    if not content:
+                        continue
+                    otp = self.extract_otp(content['body'])
+                    if otp:
+                        return otp
+            except Exception as e:
+                log(f"Inbox processing error: {e}", Fore.RED)
+            
+            if attempt < max_retries - 1:
+                time.sleep(wait_time)
+        return None
 
     @retry_with_backoff
     def get_message_token(self, mid: str) -> str:
@@ -189,10 +227,14 @@ class TempMailClient:
 def get_timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# Add thread-safe printing
+print_lock = Lock()
+
 def log(message, color=Fore.WHITE, current=None, total=None):
-    timestamp = f"[{Fore.LIGHTBLACK_EX}{get_timestamp()}{Style.RESET_ALL}]"
-    progress = f"[{Fore.LIGHTBLACK_EX}{current}/{total}{Style.RESET_ALL}]" if current is not None and total is not None else ""
-    print(f"{timestamp} {progress} {color}{message}{Style.RESET_ALL}")
+    with print_lock:
+        timestamp = f"[{Fore.LIGHTBLACK_EX}{get_timestamp()}{Style.RESET_ALL}]"
+        progress = f"[{Fore.LIGHTBLACK_EX}{current}/{total}{Style.RESET_ALL}]" if current is not None and total is not None else ""
+        print(f"{timestamp} {progress} {color}{message}{Style.RESET_ALL}")
 
 def ask(message):
     return input(f"{Fore.YELLOW}{message}{Style.RESET_ALL}")
@@ -391,18 +433,13 @@ def process_single_referral(index, total_referrals, proxy_dict, target_address, 
             mail_client.create_inbox()
             valid_code = None
             
-            for _ in range(60):
-                inbox = mail_client.get_inbox()
-                if inbox.get('messages'):
-                    message = inbox['messages'][0]
-                    token = mail_client.get_message_token(message['mid'])
-                    content = mail_client.get_message_content(token)
-                    valid_code = mail_client.extract_otp(content['body'])
-                    if valid_code:
-                        log(f"Found OTP: {valid_code}", Fore.GREEN, index, total_referrals)
-                        break
-                time.sleep(1)
-                mail_client.create_inbox()
+            # Replace OTP check loop with new process_inbox method
+            for _ in range(12):  # 12 attempts * 5 seconds = 60 seconds total
+                valid_code = mail_client.process_inbox()
+                if valid_code:
+                    log(f"Found OTP: {valid_code}", Fore.GREEN, index, total_referrals)
+                    break
+                time.sleep(5)
 
             if not valid_code:
                 log("Failed to get OTP code.", Fore.RED, index, total_referrals)
@@ -456,14 +493,36 @@ def main():
         'User-Agent': random.choice(ANDROID_USER_AGENTS)
     }
     
+    # Get number of threads
+    max_workers = min(32, total_referrals)  # Limit max threads
+    thread_count = int(ask(f'Enter number of threads (1-{max_workers}): '))
+    thread_count = max(1, min(thread_count, max_workers))
+    
     successful_referrals = 0
-    for index in range(1, total_referrals + 1):
-        proxy_dict = get_proxy_by_task(proxies, index)
-        if proxy_dict:
-            log(f"Task #{index} using proxy: {list(proxy_dict.values())[0]}", Fore.CYAN, index, total_referrals)
-        
-        if process_single_referral(index, total_referrals, proxy_dict, target_address, ref_code, headers):
-            successful_referrals += 1
+    futures = []
+    
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        for index in range(1, total_referrals + 1):
+            proxy_dict = get_proxy_by_task(proxies, index)
+            if proxy_dict:
+                log(f"Queued task #{index} with proxy: {list(proxy_dict.values())[0]}", 
+                    Fore.CYAN, index, total_referrals)
+            
+            # Submit task to thread pool
+            future = executor.submit(
+                process_single_referral,
+                index, total_referrals, proxy_dict,
+                target_address, ref_code, headers
+            )
+            futures.append(future)
+            
+        # Process completed tasks
+        for future in as_completed(futures):
+            try:
+                if future.result():
+                    successful_referrals += 1
+            except Exception as e:
+                log(f"Task failed with error: {str(e)}", Fore.RED)
     
     print(f"{Fore.MAGENTA}\nCompleted {successful_referrals}/{total_referrals} successful referrals{Style.RESET_ALL}")
 
